@@ -69,15 +69,20 @@ if [ "$NEED_DOWNLOAD" -eq 1 ]; then
     rm -f "$BIN.tmp.sha256"
     echo ">> Installed $BIN"
   else
-    # ── fallback: build from source (needs Go) ────────────────────────
-    echo ">> Release download failed — trying source build."
-    if ! command -v go >/dev/null 2>&1; then
-      echo "!! No Go toolchain and no downloadable release. Cannot continue."
+    echo "!! Could not download the release asset:"
+    echo "!!   $BASE_URL/$ASSET"
+    echo "!! Check that a release exists: https://github.com/$REPO/releases"
+    if command -v go >/dev/null 2>&1; then
+      echo ">> Go toolchain found — building from source instead."
+      BUILD_SRC=$(mktemp -d)
+      git clone --depth 1 "https://github.com/$REPO.git" "$BUILD_SRC/src"
+      ( cd "$BUILD_SRC/src" && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/modeltrack )
+      rm -rf "$BUILD_SRC"
+      echo "$LATEST" > "$VERSION_FILE"
+    else
+      echo "!! No Go toolchain in this image either. Cannot continue."
       exit 1
     fi
-    echo "!! This image has no Go compiler and the release download failed."
-    echo "!! Check that a release exists: https://github.com/$REPO/releases"
-    exit 1
   fi
 fi
 
