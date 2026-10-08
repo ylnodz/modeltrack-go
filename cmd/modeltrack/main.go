@@ -16,7 +16,15 @@ import (
 	"github.com/ylnodz/modeltrack-go/internal/tracker"
 )
 
+// version is stamped at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Println("modeltrack-go", version)
+		return
+	}
+
 	cfg := config.Load()
 	setupLogging(cfg.LogLevel)
 
