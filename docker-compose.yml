@@ -1,0 +1,15 @@
+services:
+  modeltrack:
+    build: .
+    env_file: .env
+    environment:
+      # Persist the SQLite DB outside the container lifecycle
+      DB_PATH: /data/modeltrack.db
+    volumes:
+      - modeltrack-data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  modeltrack-data:

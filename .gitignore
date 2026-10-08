@@ -1,0 +1,23 @@
+# Build artifacts
+/modeltrack
+/modeltrack-go
+/dist/
+*.exe
+
+# Local state
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets
+.env
+.env.*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test caches
+/coverage.out
