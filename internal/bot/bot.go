@@ -3,6 +3,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -29,10 +30,12 @@ type Bot struct {
 	Session *discordgo.Session
 
 	queue     chan queued
+	ready     chan struct{}
 	pagerMu   sync.Mutex
 	pagers    map[string]*pager
 	pagerSeq  int
 	closeOnce sync.Once
+	readyOnce sync.Once
 }
 
 type queued struct {
@@ -54,6 +57,7 @@ func New(cfg config.Config, store *state.Store, trk *tracker.Tracker) (*Bot, err
 		Tracker: trk,
 		Session: s,
 		queue:   make(chan queued, 256),
+		ready:   make(chan struct{}),
 		pagers:  map[string]*pager{},
 	}
 
@@ -64,26 +68,38 @@ func New(cfg config.Config, store *state.Store, trk *tracker.Tracker) (*Bot, err
 	return b, nil
 }
 
-// Run opens the gateway connection, registers commands, and blocks.
+// Run opens the gateway connection and blocks until ctx is done. Slash
+// commands are registered from the READY event, not here: Session.State.User
+// is nil until the gateway handshake completes.
 func (b *Bot) Run(ctx context.Context) error {
-	if err := b.registerCommands(); err != nil {
-		return fmt.Errorf("register commands: %w", err)
-	}
 	go b.consumeQueue(ctx)
 	go b.trackLoop(ctx)
 
 	if err := b.Session.Open(); err != nil {
 		return fmt.Errorf("open gateway: %w", err)
 	}
-	slog.Info("logged in", "user", b.Session.State.User.Username)
 
 	<-ctx.Done()
 	b.closeOnce.Do(func() { _ = b.Session.Close() })
 	return nil
 }
 
-func (b *Bot) onReady(_ *discordgo.Session, r *discordgo.Ready) {
-	slog.Info("ready", "user", r.User.Username)
+func (b *Bot) onReady(s *discordgo.Session, r *discordgo.Ready) {
+	if r.User == nil {
+		slog.Error("ready event without user; skipping command registration")
+		return
+	}
+	slog.Info("ready", "user", r.User.Username, "id", r.User.ID)
+	if err := registerCommands(s, r.User.ID, b.Config.DiscordGuildID, b.buildCommands()); err != nil {
+		slog.Error("register slash commands", "err", err)
+	} else {
+		slog.Info("registered slash commands", "count", len(b.buildCommands()))
+	}
+	// Unblock the send queue: messages posted before the gateway handshake
+	// completes are held rather than dropped. sync.Once keeps reconnects safe.
+	if b.ready != nil {
+		b.readyOnce.Do(func() { close(b.ready) })
+	}
 }
 
 // ── send queue ────────────────────────────────────────────────
@@ -103,6 +119,14 @@ func (b *Bot) sendEvent(ctx context.Context, e state.Event, content string) erro
 }
 
 func (b *Bot) consumeQueue(ctx context.Context) {
+	// Hold deliveries until the gateway is ready so early events aren't dropped.
+	if b.ready != nil {
+		select {
+		case <-b.ready:
+		case <-ctx.Done():
+			return
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -162,21 +186,19 @@ func (b *Bot) trackLoop(ctx context.Context) {
 
 // ── slash commands ────────────────────────────────────────────
 
-func (b *Bot) registerCommands() error {
-	cmds := b.buildCommands()
-
-	for _, c := range cmds {
-		var err error
-		if b.Config.DiscordGuildID != "" {
-			_, err = b.Session.ApplicationCommandCreate(b.Session.State.User.ID, b.Config.DiscordGuildID, c)
-		} else {
-			_, err = b.Session.ApplicationCommandCreate(b.Session.State.User.ID, "", c)
-		}
-		if err != nil {
-			return err
-		}
+// registerCommands publishes the slash commands for the application. It is a
+// no-op when appID is empty, so it can never nil-deref before the gateway is
+// ready. Overwrite (not Create) keeps it idempotent across reconnects.
+func registerCommands(s *discordgo.Session, appID, guildID string, cmds []*discordgo.ApplicationCommand) error {
+	if s == nil {
+		return errors.New("nil session")
 	}
-	slog.Info("registered slash commands", "count", len(cmds))
+	if appID == "" {
+		return errors.New("empty application id (gateway not ready)")
+	}
+	if _, err := s.ApplicationCommandBulkOverwrite(appID, guildID, cmds); err != nil {
+		return err
+	}
 	return nil
 }
 

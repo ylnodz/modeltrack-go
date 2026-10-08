@@ -11,6 +11,29 @@ import (
 	"github.com/ylnodz/modeltrack-go/internal/tracker"
 )
 
+func TestRegisterCommandsGuardsAgainstNilSessionAndEmptyAppID(t *testing.T) {
+	cmds := []*discordgo.ApplicationCommand{{Name: "free"}}
+
+	// Nil session must not panic.
+	if err := registerCommands(nil, "123", "", cmds); err == nil {
+		t.Fatal("nil session must error")
+	}
+	// Empty app id (gateway not ready) must not panic and must not call the API.
+	if err := registerCommands(&discordgo.Session{}, "", "", cmds); err == nil {
+		t.Fatal("empty app id must error")
+	}
+	// The pre-fix crash path: a real session with a nil State.User. Registration
+	// must be driven by the app id argument, never by Session.State.User.
+	s := &discordgo.Session{}
+	if s.State == nil || s.State.User == nil {
+		// Confirm this is the exact condition that used to segfault, and that
+		// registerCommands no longer touches it.
+		if err := registerCommands(s, "", "", cmds); err == nil {
+			t.Fatal("nil State.User path must be guarded")
+		}
+	}
+}
+
 func TestBuildCommandsRegistersFreeAndStatusWithProviderChoices(t *testing.T) {
 	store, err := state.Open(filepath.Join(t.TempDir(), "b.db"))
 	if err != nil {
