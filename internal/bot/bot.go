@@ -49,6 +49,19 @@ func New(cfg config.Config, store *state.Store, trk *tracker.Tracker) (*Bot, err
 	if err != nil {
 		return nil, err
 	}
+	// discordgo logs through its own logger, which writes to stdout behind
+	// slog's back. Route it into slog.
+	//
+	// Its LogError level is not reserved for fatal problems: discordgo uses it
+	// for the benign "rate limit unmarshal error" notice emitted whenever a 429
+	// body is not a TooManyRequests object (Discord serves an HTML/plain-text
+	// body in that case). Real failures are still returned to the caller and
+	// logged by us, so discordgo's own output goes to Debug to keep the
+	// production log signal-only.
+	discordgo.Logger = func(msgL, caller int, format string, a ...interface{}) {
+		slog.Debug("discordgo", "level", msgL, "msg", fmt.Sprintf(format, a...))
+	}
+	s.LogLevel = discordgo.LogInformational
 	s.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages
 
 	b := &Bot{
@@ -189,6 +202,12 @@ func (b *Bot) trackLoop(ctx context.Context) {
 // registerCommands publishes the slash commands for the application. It is a
 // no-op when appID is empty, so it can never nil-deref before the gateway is
 // ready. Overwrite (not Create) keeps it idempotent across reconnects.
+//
+// Exactly one scope owns the commands. When a guild is configured the commands
+// are guild-scoped (instant propagation) and the global scope is cleared;
+// otherwise they are global. Discord stores the two scopes independently and
+// renders a command once per scope it exists in, so an old global copy left
+// behind by a previous deployment shows up as a duplicate /free.
 func registerCommands(s *discordgo.Session, appID, guildID string, cmds []*discordgo.ApplicationCommand) error {
 	if s == nil {
 		return errors.New("nil session")
@@ -196,10 +215,15 @@ func registerCommands(s *discordgo.Session, appID, guildID string, cmds []*disco
 	if appID == "" {
 		return errors.New("empty application id (gateway not ready)")
 	}
-	if _, err := s.ApplicationCommandBulkOverwrite(appID, guildID, cmds); err != nil {
+	if guildID != "" {
+		if _, err := s.ApplicationCommandBulkOverwrite(appID, "", nil); err != nil {
+			return fmt.Errorf("clear global commands: %w", err)
+		}
+		_, err := s.ApplicationCommandBulkOverwrite(appID, guildID, cmds)
 		return err
 	}
-	return nil
+	_, err := s.ApplicationCommandBulkOverwrite(appID, "", cmds)
+	return err
 }
 
 // buildCommands returns the slash-command definitions, including the provider

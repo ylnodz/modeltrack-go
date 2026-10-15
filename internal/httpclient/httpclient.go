@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -113,7 +114,14 @@ func doGet(ctx context.Context, url string, headers, params map[string]string) (
 			&RetryableError{Status: resp.StatusCode}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, resp.StatusCode, 0, fmt.Errorf("http %d for %s", resp.StatusCode, url)
+		snippet := strings.TrimSpace(string(body))
+		if len(snippet) > 240 {
+			snippet = snippet[:240] + "…"
+		}
+		if snippet == "" {
+			snippet = "(empty body)"
+		}
+		return nil, resp.StatusCode, 0, fmt.Errorf("http %d for %s: %s", resp.StatusCode, url, snippet)
 	}
 	return body, resp.StatusCode, 0, nil
 }

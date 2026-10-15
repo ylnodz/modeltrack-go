@@ -94,12 +94,69 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 
 	s := &Store{db: db, path: path, fresh: fresh}
 	if fresh {
 		_ = s.SetMeta(context.Background(), "resumed", fmt.Sprint(time.Now().Unix()))
 	}
 	return s, nil
+}
+
+// migrate brings an existing database up to the columns the current binary
+// reads. Without it, a DB created by an older binary (or by the Python
+// modeltrack, which shares DB_PATH but has no deprecated_at column) keeps its
+// old shape: CREATE TABLE IF NOT EXISTS silently no-ops on an existing table,
+// so every DiffAndApply then fails with "no such column".
+func migrate(db *sql.DB) error {
+	required := map[string]map[string]string{
+		"models": {
+			"deprecated_at": "REAL",
+			"missing_since": "REAL",
+			"extra":         "TEXT",
+			"description":   "TEXT",
+		},
+		"events": {"detail": "TEXT"},
+	}
+	for table, cols := range required {
+		have, err := columns(db, table)
+		if err != nil {
+			return err
+		}
+		if len(have) == 0 {
+			continue // table absent; schema just created it
+		}
+		for col, typ := range cols {
+			if have[col] {
+				continue
+			}
+			if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, col, typ)); err != nil {
+				return fmt.Errorf("add %s.%s: %w", table, col, err)
+			}
+		}
+	}
+	return nil
+}
+
+// columns reports the existing column names of table, empty if it is absent.
+func columns(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query("SELECT name FROM pragma_table_info(?)", table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
 }
 
 // Close releases the database handle.
@@ -388,13 +445,21 @@ type scanner interface{ Scan(dest ...any) error }
 func scanModel(sc scanner) (model.Model, error) {
 	var m model.Model
 	var isFree int
+	// Text columns are scanned as nullables: a database written by another
+	// binary (or by hand) can hold NULLs, and a plain string scan would abort
+	// the whole read instead of treating the value as empty.
+	var name, author, url, desc sql.NullString
 	var freeNote, modalities, extra sql.NullString
 	var ctxLen sql.NullInt64
 	var pIn, pOut sql.NullFloat64
-	if err := sc.Scan(&m.Source, &m.PK, &m.Name, &m.Author, &m.URL, &isFree, &freeNote,
-		&ctxLen, &modalities, &pIn, &pOut, &m.Description, &extra); err != nil {
+	if err := sc.Scan(&m.Source, &m.PK, &name, &author, &url, &isFree, &freeNote,
+		&ctxLen, &modalities, &pIn, &pOut, &desc, &extra); err != nil {
 		return m, err
 	}
+	m.Name = name.String
+	m.Author = author.String
+	m.URL = url.String
+	m.Description = desc.String
 	m.IsFree = isFree == 1
 	m.FreeNote = freeNote.String
 	if ctxLen.Valid {

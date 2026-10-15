@@ -105,16 +105,29 @@ func TestOnReadyRegistersCommandsViaRealAPIPath(t *testing.T) {
 	}
 }
 
-// TestOnReadyGuildScopedUsesGuildEndpoint covers the DISCORD_GUILD_ID path.
-func TestOnReadyGuildScopedUsesGuildEndpoint(t *testing.T) {
-	pathCh := make(chan string, 1)
+// TestOnReadyGuildScopedClearsGlobalScope covers the DISCORD_GUILD_ID path.
+// Discord stores guild and global commands independently and renders a command
+// once per scope it exists in, so an old global /free left by a previous
+// deployment shows up as a duplicate. Guild registration must therefore also
+// clear the global scope.
+func TestOnReadyGuildScopedClearsGlobalScope(t *testing.T) {
+	type captured struct {
+		method string
+		path   string
+		body   []*discordgo.ApplicationCommand
+	}
+	var (
+		mu  sync.Mutex
+		got []captured
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case pathCh <- r.URL.Path:
-		default:
-		}
+		var body []*discordgo.ApplicationCommand
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		got = append(got, captured{method: r.Method, path: r.URL.Path, body: body})
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte("[]"))
+		_ = json.NewEncoder(w).Encode(body)
 	}))
 	defer srv.Close()
 
@@ -130,13 +143,32 @@ func TestOnReadyGuildScopedUsesGuildEndpoint(t *testing.T) {
 
 	b.onReady(s, &discordgo.Ready{User: &discordgo.User{ID: "424242", Username: "m"}})
 
-	select {
-	case p := <-pathCh:
-		if !strings.Contains(p, "/applications/424242/guilds/777/commands") {
-			t.Fatalf("guild-scoped path: %s", p)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("want 2 requests (clear globals + set guild), got %d: %+v", len(got), got)
+	}
+
+	var cleared, registered *captured
+	for i := range got {
+		switch {
+		case strings.Contains(got[i].path, "/guilds/777/commands"):
+			registered = &got[i]
+		case strings.HasSuffix(got[i].path, "/applications/424242/commands"):
+			cleared = &got[i]
 		}
-	default:
-		t.Fatal("no request for guild-scoped registration")
+	}
+	if cleared == nil {
+		t.Fatalf("global scope never cleared: %+v", got)
+	}
+	if len(cleared.body) != 0 {
+		t.Fatalf("global clear must send an empty list, got %d entries", len(cleared.body))
+	}
+	if registered == nil {
+		t.Fatalf("guild scope never registered: %+v", got)
+	}
+	if len(registered.body) != 2 {
+		t.Fatalf("guild registration: want 2 commands, got %d", len(registered.body))
 	}
 }
 
