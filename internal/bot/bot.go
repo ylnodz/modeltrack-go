@@ -50,16 +50,27 @@ func New(cfg config.Config, store *state.Store, trk *tracker.Tracker) (*Bot, err
 		return nil, err
 	}
 	// discordgo logs through its own logger, which writes to stdout behind
-	// slog's back. Route it into slog.
+	// slog's back. Route it into slog so its diagnostics honour LOG_LEVEL and
+	// keep our format.
 	//
-	// Its LogError level is not reserved for fatal problems: discordgo uses it
-	// for the benign "rate limit unmarshal error" notice emitted whenever a 429
-	// body is not a TooManyRequests object (Discord serves an HTML/plain-text
-	// body in that case). Real failures are still returned to the caller and
-	// logged by us, so discordgo's own output goes to Debug to keep the
-	// production log signal-only.
+	// Its LogError level is not reserved for fatal problems — it also fires for
+	// the benign "rate limit unmarshal error" notice emitted when a 429 body is
+	// not a TooManyRequests object. That one is noise, but the rest are real
+	// (e.g. "error decoding websocket message", which is how a gateway closed by
+	// an intercepting proxy surfaces), so only that message is demoted to Debug
+	// and everything else keeps Error.
 	discordgo.Logger = func(msgL, caller int, format string, a ...interface{}) {
-		slog.Debug("discordgo", "level", msgL, "msg", fmt.Sprintf(format, a...))
+		msg := fmt.Sprintf(format, a...)
+		if strings.Contains(msg, "rate limit unmarshal error") {
+			slog.Debug("discordgo", "msg", msg)
+			return
+		}
+		switch msgL {
+		case discordgo.LogError, discordgo.LogWarning:
+			slog.Error("discordgo", "msg", msg)
+		default:
+			slog.Debug("discordgo", "msg", msg)
+		}
 	}
 	s.LogLevel = discordgo.LogInformational
 	s.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages
