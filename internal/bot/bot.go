@@ -63,6 +63,12 @@ func New(cfg config.Config, store *state.Store, trk *tracker.Tracker) (*Bot, err
 	}
 	s.LogLevel = discordgo.LogInformational
 	s.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages
+	// Surface non-JSON REST responses (Cloudflare blocks, proxy error pages)
+	// instead of letting them reduce to a bare json error at the call site.
+	// discordgo.New always installs an http.Client, so this only wraps it.
+	if s.Client != nil {
+		s.Client.Transport = newDiagTransport(s.Client.Transport)
+	}
 
 	b := &Bot{
 		Config:  cfg,
@@ -88,13 +94,73 @@ func (b *Bot) Run(ctx context.Context) error {
 	go b.consumeQueue(ctx)
 	go b.trackLoop(ctx)
 
-	if err := b.Session.Open(); err != nil {
+	if err := b.openWithRetry(ctx); err != nil {
 		return fmt.Errorf("open gateway: %w", err)
 	}
 
 	<-ctx.Done()
 	b.closeOnce.Do(func() { _ = b.Session.Close() })
 	return nil
+}
+
+// Gateway handshake retry policy. Open fetches the gateway URL over REST and
+// then connects; a transient upstream failure (proxy error page, rate-limit
+// block, 5xx) would otherwise kill the process at startup, and the host runs
+// this binary directly, so a transient block must not be fatal.
+//
+// Transient failures are retried indefinitely with a capped backoff so the bot
+// comes up on its own once Discord or the edge recovers. Configuration errors
+// (see isFatalHandshakeError) still fail immediately — those cannot be fixed by
+// waiting.
+//
+// Vars rather than consts so tests can inject failures and shrink the backoff.
+var (
+	openBaseDelay = 5 * time.Second
+	openMaxDelay  = 5 * time.Minute
+
+	// sessionOpen performs one handshake attempt.
+	sessionOpen = func(s *discordgo.Session) error { return s.Open() }
+)
+
+// openWithRetry retries a transient handshake failure with capped exponential
+// backoff until it succeeds or ctx is cancelled.
+func (b *Bot) openWithRetry(ctx context.Context) error {
+	var err error
+	for attempt := 1; ; attempt++ {
+		err = sessionOpen(b.Session)
+		if err == nil {
+			if attempt > 1 {
+				slog.Info("gateway connection established", "attempt", attempt)
+			}
+			return nil
+		}
+		if isFatalHandshakeError(err) {
+			return err
+		}
+
+		delay := openBaseDelay << uint(min(attempt-1, 16))
+		if delay <= 0 || delay > openMaxDelay {
+			delay = openMaxDelay
+		}
+		slog.Warn("gateway handshake failed; retrying",
+			"attempt", attempt, "retry_in", delay.String(), "err", err)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+}
+
+// isFatalHandshakeError reports failures a retry cannot fix: 4004 is an invalid
+// token and 4014 disallowed intents, both configuration problems rather than
+// transient upstream failures.
+func isFatalHandshakeError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "4004") ||
+		strings.Contains(msg, "4014") ||
+		strings.Contains(msg, "Authentication failed")
 }
 
 func (b *Bot) onReady(s *discordgo.Session, r *discordgo.Ready) {
